@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * NEAR-BOT — cooperative testnet agent.
- * Holds keys locally; asks ASGUARD for pre-sign approval before any value-moving tx.
+ * Creates its own implicit account, encrypts keys with your password,
+ * and asks ASGUARD for pre-sign approval before transfers.
  */
 import 'dotenv/config';
 import { createInterface } from 'node:readline/promises';
@@ -11,11 +12,13 @@ import {
   KEYSTORE_PATH,
   connectNear,
   formatNear,
-  loadWallet,
+  generateNewWallet,
+  importWallet,
+  loadWalletFile,
   networkFromEnv,
   parseNear,
-  saveWallet,
-  type StoredWallet,
+  saveWalletFile,
+  unlockWallet,
 } from './wallet.js';
 import {
   agentIdentity,
@@ -32,63 +35,94 @@ async function ask(prompt: string, def?: string): Promise<string> {
   return answer || def || '';
 }
 
-async function cmdSetup(): Promise<void> {
-  console.log(chalk.cyan('\n=== NEAR agent setup (testnet recommended) ===\n'));
-  console.log('Keys stay in', chalk.yellow(KEYSTORE_PATH));
-  console.log('Never commit this file. Fund the account via a testnet faucet after setup.\n');
-
-  const network = networkFromEnv();
-  const accountId = await ask('NEAR account id', process.env.NEAR_ACCOUNT_ID);
-  const privateKey = await ask('Private key (ed25519:...)', process.env.NEAR_PRIVATE_KEY);
-
-  if (!accountId || !privateKey) {
-    throw new Error('account id and private key are required');
-  }
-  if (!privateKey.startsWith('ed25519:')) {
-    throw new Error('private key must start with ed25519:');
-  }
-
-  const wallet: StoredWallet = {
-    networkId: network.networkId,
-    accountId,
-    privateKey,
-  };
-  saveWallet(wallet);
-
-  try {
-    const { account } = await connectNear(wallet);
-    const bal = await account.getAccountBalance();
-    console.log(chalk.green('\nWallet saved.'));
-    console.log('  account:', wallet.accountId);
-    console.log('  network:', wallet.networkId);
-    console.log('  balance:', formatNear(bal.available));
-  } catch (err) {
-    console.log(chalk.yellow('\nWallet saved, but RPC check failed:'));
-    console.log(String(err));
-    console.log('You can still fund/create the account, then run: npm start → balance');
-  }
+async function askSecret(prompt: string): Promise<string> {
+  // readline cannot mask easily cross-platform; warn user
+  console.log(chalk.dim('(input is visible in this terminal — use a unique password)'));
+  return ask(prompt);
 }
 
-async function requireWallet(): Promise<StoredWallet> {
-  const wallet = loadWallet();
-  if (!wallet) {
-    throw new Error(`No keystore at ${KEYSTORE_PATH}. Run: npm run setup`);
+async function cmdSetup(): Promise<void> {
+  console.log(chalk.cyan('\n=== NEAR agent setup ===\n'));
+  console.log('Default: generate a new keypair + implicit account, encrypt with your password.');
+  console.log('Keys file:', chalk.yellow(KEYSTORE_PATH));
+  console.log('The private key is NEVER stored in plaintext.\n');
+
+  const mode = (await ask('Mode: new (generate) or import', 'new')).toLowerCase();
+
+  if (mode === 'import') {
+    const accountId = await ask('NEAR account id');
+    const privateKey = await askSecret('Private key (ed25519:...)');
+    const password = await askSecret('Password to encrypt keystore (min 8 chars)');
+    const confirm = await askSecret('Confirm password');
+    if (password !== confirm) throw new Error('passwords do not match');
+    const file = importWallet(accountId, privateKey, password);
+    saveWalletFile(file);
+    console.log(chalk.green('\nImported and encrypted.'));
+    console.log('  account:', file.accountId);
+    return;
   }
-  return wallet;
+
+  const password = await askSecret('Choose a password (min 8 chars) — needed to unlock / reveal key');
+  const confirm = await askSecret('Confirm password');
+  if (password !== confirm) throw new Error('passwords do not match');
+
+  if (loadWalletFile()) {
+    const overwrite = (await ask('Keystore exists. Overwrite? (yes/no)', 'no')).toLowerCase();
+    if (overwrite !== 'yes' && overwrite !== 'y') {
+      console.log('Aborted.');
+      return;
+    }
+  }
+
+  const { file, accountId } = generateNewWallet(password);
+  saveWalletFile(file);
+
+  console.log(chalk.green('\nNew agent wallet created.'));
+  console.log('  account id (implicit):', chalk.bold(accountId));
+  console.log('  network:             ', file.networkId);
+  console.log('\nThis account activates when it receives funds.');
+  console.log('Fund it on testnet, e.g. https://near-faucet.io/ or any testnet faucet,');
+  console.log('paste the account id above as the recipient.');
+  console.log('\nReveal the private key later with:  npm start -- reveal');
+}
+
+async function unlockInteractive(): Promise<ReturnType<typeof unlockWallet>> {
+  const password = await askSecret('Keystore password');
+  return unlockWallet(password);
+}
+
+async function cmdReveal(): Promise<void> {
+  const file = loadWalletFile();
+  if (!file) throw new Error(`No keystore at ${KEYSTORE_PATH}. Run: npm run setup`);
+
+  console.log(chalk.yellow('\nRevealing the private key. Ensure no one can see your screen.\n'));
+  const wallet = await unlockInteractive();
+
+  console.log(chalk.green('Unlocked'));
+  console.log('  account:    ', wallet.accountId);
+  console.log('  network:    ', wallet.networkId);
+  console.log('  private key:', wallet.privateKey);
+  console.log(chalk.dim('\nStore this offline if you need a backup. Anyone with this key controls the account.'));
 }
 
 async function cmdBalance(): Promise<void> {
-  const wallet = await requireWallet();
+  const wallet = await unlockInteractive();
   const { account } = await connectNear(wallet);
-  const bal = await account.getAccountBalance();
-  console.log(chalk.green('Account'), wallet.accountId);
-  console.log('  available:', formatNear(bal.available));
-  console.log('  total:    ', formatNear(bal.total));
-  console.log('  network:  ', networkFromEnv().networkId);
+  try {
+    const bal = await account.getAccountBalance();
+    console.log(chalk.green('Account'), wallet.accountId);
+    console.log('  available:', formatNear(bal.available));
+    console.log('  total:    ', formatNear(bal.total));
+    console.log('  network:  ', networkFromEnv().networkId);
+  } catch (err) {
+    console.log(chalk.yellow('Account may be unfunded (implicit accounts show up after first deposit).'));
+    console.log('  account:', wallet.accountId);
+    console.log('  error:  ', String(err instanceof Error ? err.message : err));
+  }
 }
 
 async function cmdSend(receiverArg?: string, amountArg?: string): Promise<void> {
-  const wallet = await requireWallet();
+  const wallet = await unlockInteractive();
   const receiver = receiverArg || (await ask('Receiver account id'));
   const amountNear = amountArg || (await ask('Amount in NEAR', '0.01'));
 
@@ -99,7 +133,6 @@ async function cmdSend(receiverArg?: string, amountArg?: string): Promise<void> 
   const network = networkFromEnv();
   const identity = agentIdentity();
 
-  // Canonical intent — payload_hash binds ASGUARD attestation to these exact fields.
   const intent = {
     chain: 'near',
     network: network.networkId,
@@ -166,56 +199,31 @@ async function cmdSend(receiverArg?: string, amountArg?: string): Promise<void> 
 }
 
 async function cmdStatus(): Promise<void> {
-  const wallet = loadWallet();
-  console.log('keystore:', wallet ? chalk.green(wallet.accountId) : chalk.red('missing'));
+  const file = loadWalletFile();
+  console.log('keystore:', file ? chalk.green(file.accountId) : chalk.red('missing'));
+  if (file) {
+    console.log('  created:', file.createdAt);
+    console.log('  encrypted: yes (password required to unlock)');
+  }
   console.log('network: ', networkFromEnv().networkId, networkFromEnv().nodeUrl);
   console.log('asguard: ', asguardEnabled() ? chalk.green('enabled') : chalk.yellow('disabled'));
   console.log('asguard url:', process.env.ASGUARD_URL || 'http://localhost:8080');
   console.log('agent id:  ', agentIdentity().agent_id);
-
-  if (asguardEnabled() && process.env.ASGUARD_RUNTIME_TOKEN) {
-    try {
-      const base = (process.env.ASGUARD_URL || 'http://localhost:8080').replace(/\/$/, '');
-      const res = await fetch(`${base}/mcp`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${process.env.ASGUARD_RUNTIME_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'tools/call',
-          params: { name: 'asguard_get_status', arguments: {} },
-        }),
-      });
-      const body = await res.json();
-      console.log('asguard status response:', JSON.stringify(body).slice(0, 400));
-    } catch (err) {
-      console.log(chalk.yellow('could not reach ASGUARD:'), String(err));
-    }
-  }
 }
 
 function printHelp(): void {
   console.log(`
-${chalk.bold('NEAR-BOT')} — NEAR testnet agent with optional ASGUARD pre-sign gate
+${chalk.bold('NEAR-BOT')} — creates its own wallet; password unlocks keys; ASGUARD gates sends
 
 Usage:
-  npm run setup              Import account + private key into local keystore
-  npm start                  Interactive menu
-  npm start -- balance       Show balance
-  npm start -- send          Prompt and send NEAR (gated)
-  npm start -- send <to> <amountNear>
-  npm start -- status        Local + ASGUARD config
+  npm run setup              Generate new account (or import) + encrypt with password
+  npm start -- reveal        Show private key after password check
+  npm start -- balance       Unlock + show balance
+  npm start -- send [to] [near]
+  npm start -- status
+  npm start                  Menu
 
-Env (near-agent/.env):
-  NEAR_NETWORK_ID=testnet
-  NEAR_RPC_URL=https://test.rpc.fastnear.com
-  ASGUARD_ENABLED=true
-  ASGUARD_URL=http://localhost:8080
-  ASGUARD_RUNTIME_TOKEN=<runtime token from ASGUARD_API_CREDENTIALS>
-  ASGUARD_AGENT_ID=near-bot
+New accounts are NEAR implicit accounts (64-char hex). Fund via a testnet faucet.
 `);
 }
 
@@ -224,8 +232,9 @@ async function menu(): Promise<void> {
   console.log('  1) balance');
   console.log('  2) send');
   console.log('  3) status');
-  console.log('  4) setup');
-  console.log('  5) help / quit');
+  console.log('  4) setup (new wallet)');
+  console.log('  5) reveal private key');
+  console.log('  6) help');
   const choice = await ask('Choose', '1');
   switch (choice) {
     case '1':
@@ -240,6 +249,9 @@ async function menu(): Promise<void> {
     case '4':
       await cmdSetup();
       break;
+    case '5':
+      await cmdReveal();
+      break;
     default:
       printHelp();
   }
@@ -251,6 +263,7 @@ async function main(): Promise<void> {
 
   try {
     if (cmd === 'setup') await cmdSetup();
+    else if (cmd === 'reveal') await cmdReveal();
     else if (cmd === 'balance') await cmdBalance();
     else if (cmd === 'send') await cmdSend(args[1], args[2]);
     else if (cmd === 'status') await cmdStatus();
