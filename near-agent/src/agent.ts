@@ -25,9 +25,23 @@ import {
   asguardEnabled,
   hashPayload,
   requireApproved,
+  transportFromEnv,
 } from './asguard.js';
+import { runAutonomous } from './autonomous.js';
 
 const rl = createInterface({ input, output });
+
+let stopRequested = false;
+
+function installStopHandlers(): void {
+  const onStop = () => {
+    if (stopRequested) return;
+    stopRequested = true;
+    console.log(chalk.yellow('\nStop requested — finishing current step...'));
+  };
+  process.on('SIGINT', onStop);
+  process.on('SIGTERM', onStop);
+}
 
 async function ask(prompt: string, def?: string): Promise<string> {
   const suffix = def ? ` [${def}]` : '';
@@ -36,7 +50,6 @@ async function ask(prompt: string, def?: string): Promise<string> {
 }
 
 async function askSecret(prompt: string): Promise<string> {
-  // readline cannot mask easily cross-platform; warn user
   console.log(chalk.dim('(input is visible in this terminal — use a unique password)'));
   return ask(prompt);
 }
@@ -149,7 +162,7 @@ async function cmdSend(receiverArg?: string, amountArg?: string): Promise<void> 
   console.log('payload_hash:', payloadHash);
 
   if (asguardEnabled()) {
-    console.log(chalk.cyan('\nRequesting ASGUARD pre-sign approval...'));
+    console.log(chalk.cyan(`\nRequesting ASGUARD pre-sign approval (${transportFromEnv()})...`));
     const amountUsd = Number(process.env.NEAR_USD_HINT || '0') || undefined;
     const approval = await requireApproved({
       agent_id: identity.agent_id,
@@ -198,6 +211,19 @@ async function cmdSend(receiverArg?: string, amountArg?: string): Promise<void> 
   );
 }
 
+async function cmdAutonomous(): Promise<void> {
+  installStopHandlers();
+  const wallet = await unlockInteractive();
+  const go = (await ask('Start autonomous loop until Ctrl+C? (yes/no)', 'yes')).toLowerCase();
+  if (go !== 'yes' && go !== 'y') {
+    console.log('Aborted.');
+    return;
+  }
+  // Close readline so Ctrl+C is not swallowed oddly during long sleeps
+  rl.close();
+  await runAutonomous(wallet, { shouldStop: () => stopRequested });
+}
+
 async function cmdStatus(): Promise<void> {
   const file = loadWalletFile();
   console.log('keystore:', file ? chalk.green(file.accountId) : chalk.red('missing'));
@@ -207,23 +233,26 @@ async function cmdStatus(): Promise<void> {
   }
   console.log('network: ', networkFromEnv().networkId, networkFromEnv().nodeUrl);
   console.log('asguard: ', asguardEnabled() ? chalk.green('enabled') : chalk.yellow('disabled'));
+  console.log('transport:', transportFromEnv());
   console.log('asguard url:', process.env.ASGUARD_URL || 'http://localhost:8080');
+  console.log('mcp url:    ', process.env.ASGUARD_MCP_URL || 'http://localhost:8080/mcp');
   console.log('agent id:  ', agentIdentity().agent_id);
 }
 
 function printHelp(): void {
   console.log(`
-${chalk.bold('NEAR-BOT')} — creates its own wallet; password unlocks keys; ASGUARD gates sends
+${chalk.bold('NEAR-BOT')} — wallet + ASGUARD-gated sends + autonomous loop
 
 Usage:
-  npm run setup              Generate new account (or import) + encrypt with password
-  npm start -- reveal        Show private key after password check
-  npm start -- balance       Unlock + show balance
-  npm start -- send [to] [near]
-  npm start -- status
-  npm start                  Menu
+  npm run setup
+  npm start -- reveal | balance | send | status | autonomous
+  npm start -- autonomous
 
-New accounts are NEAR implicit accounts (64-char hex). Fund via a testnet faucet.
+Autonomous: random 0.01–0.1 NEAR transfers/wraps every 5–30s until Ctrl+C.
+HITL: agent waits for your ASGUARD decision before signing.
+
+ASGUARD_TRANSPORT=auto|rest|mcp
+ASGUARD_RUNTIME_TOKEN=<token from ASGUARD_API_CREDENTIALS with role runtime>
 `);
 }
 
@@ -234,7 +263,8 @@ async function menu(): Promise<void> {
   console.log('  3) status');
   console.log('  4) setup (new wallet)');
   console.log('  5) reveal private key');
-  console.log('  6) help');
+  console.log('  6) autonomous');
+  console.log('  7) help');
   const choice = await ask('Choose', '1');
   switch (choice) {
     case '1':
@@ -252,6 +282,9 @@ async function menu(): Promise<void> {
     case '5':
       await cmdReveal();
       break;
+    case '6':
+      await cmdAutonomous();
+      break;
     default:
       printHelp();
   }
@@ -267,6 +300,7 @@ async function main(): Promise<void> {
     else if (cmd === 'balance') await cmdBalance();
     else if (cmd === 'send') await cmdSend(args[1], args[2]);
     else if (cmd === 'status') await cmdStatus();
+    else if (cmd === 'autonomous' || cmd === 'auto') await cmdAutonomous();
     else if (cmd === 'help' || cmd === '-h' || cmd === '--help') printHelp();
     else if (!cmd) await menu();
     else {
@@ -274,7 +308,11 @@ async function main(): Promise<void> {
       throw new Error(`unknown command: ${cmd}`);
     }
   } finally {
-    rl.close();
+    try {
+      rl.close();
+    } catch {
+      /* already closed after autonomous */
+    }
   }
 }
 

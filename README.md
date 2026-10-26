@@ -1,15 +1,11 @@
 # NEAR-BOT
 
-TypeScript CLI agent for **NEAR testnet**. On setup it can **create its own account** (implicit account + keypair), **encrypt the private key with your password**, and only **reveal the key when the correct password is entered**. Optional **[ASGUARD](https://github.com/Obahakim/ASGUARD)** pre-sign approval before transfers.
+TypeScript CLI agent for **NEAR testnet**:
 
-ASGUARD does **not** hold private keys. This agent signs locally after approval (or with the gate disabled for local dev).
-
-## Requirements
-
-- Node.js 20+
-- Optional: ASGUARD on `http://localhost:8080` with a runtime API token
-
-You do **not** need an existing NEAR key to start. Setup generates one.
+- Generates its own **implicit account** and encrypts the private key with your password
+- **ASGUARD** pre-sign gate via **REST and/or MCP**
+- **Autonomous** loop: random transfers / wraps every 5–30s until **Ctrl+C**
+- On HITL, the agent **waits** for your decision (does not skip)
 
 ## Install
 
@@ -18,60 +14,54 @@ git clone https://github.com/Obahakim/NEAR-BOT.git
 cd NEAR-BOT/near-agent
 npm install
 cp .env.example .env
-```
-
-## Create a new agent wallet
-
-```bash
 npm run setup
 ```
 
-Choose **new** (default):
+## Runtime token (ASGUARD)
 
-1. Enter a password (min 8 characters) twice  
-2. Agent generates an ed25519 keypair  
-3. Account id = NEAR **implicit account** (64-char hex of the public key)  
-4. Private key is stored **encrypted** in `agent-keystore.json`
+The bot’s `ASGUARD_RUNTIME_TOKEN` is **one of the API tokens** from ASGUARD’s `ASGUARD_API_CREDENTIALS` — specifically the entry whose **roles** include **`runtime`**.
 
-Fund the account on testnet (faucet), using the printed account id as recipient. Implicit accounts become active when first funded — no separate create-account tx.
+It is **not** a separate system, and it should **not** be the dashboard `admin` / `operator` token.
 
-### Import an existing key (optional)
+In ASGUARD `.env`:
 
-```bash
-npm run setup
-# mode: import
+```env
+ASGUARD_API_CREDENTIALS=[{"id":"runtime-local","token":"YOUR_LONG_RANDOM_RUNTIME_TOKEN","roles":["runtime"]},{"id":"dashboard-local","token":"DIFFERENT_DASHBOARD_TOKEN","roles":["admin","operator","auditor"]}]
 ```
 
-### Reveal private key
+Generate tokens (32+ bytes):
 
 ```bash
-npm start -- reveal
+node -p "require('node:crypto').randomBytes(32).toString('base64url')"
 ```
 
-Enter the password. Wrong password → key is not revealed.
+Put the **runtime** token into NEAR-BOT `.env`:
+
+```env
+ASGUARD_RUNTIME_TOKEN=YOUR_LONG_RANDOM_RUNTIME_TOKEN
+ASGUARD_TRANSPORT=auto   # auto | rest | mcp
+ASGUARD_URL=http://localhost:8080
+ASGUARD_MCP_URL=http://localhost:8080/mcp
+```
+
+Same token authenticates both `POST /api/approvals/...` and `POST /mcp`.
+
+## Autonomous mode
+
+```bash
+npm run autonomous
+# or: npm start -- autonomous
+```
+
+- Amounts: 0.01–0.1 NEAR (configurable)
+- Delay: 5–30 seconds
+- Actions: transfers (allowlist / self) + wrap NEAR (`wrap.testnet`)
+- **No max runtime** — stop with **Ctrl+C**
+- HITL: loop blocks until you approve/deny in ASGUARD (or timeout deny)
 
 ## Commands
 
 ```bash
-npm start                 # menu
-npm run setup             # new or import
-npm start -- reveal
-npm start -- balance      # asks password
-npm start -- send <to> 0.01
-npm run status
+npm run setup
+npm start -- balance | send | status | reveal | autonomous
 ```
-
-## ASGUARD flow
-
-1. Unlock keystore with password  
-2. Build transfer intent + `payload_hash`  
-3. `POST /api/approvals/sign-request` (`chain: near`, `network: testnet`)  
-4. On approve, sign and broadcast locally  
-
-Set `ASGUARD_ENABLED=false` only for offline debugging.
-
-## Security
-
-- Private key is encrypted (scrypt + AES-256-GCM); plaintext only in memory after password unlock  
-- Never commit `agent-keystore.json` or `.env`  
-- Prefer testnet for demos  
